@@ -68,20 +68,19 @@ func (k KvStore) Get(key string) (value string, err error) {
 }
 
 func (k KvStore) Del(key string) error {
-	offset, ok := k.IndexCache.Get(key)
+	_, ok := k.IndexCache.Get(key)
 	k.Cache.Remove(key)
 	k.IndexCache.Remove(key)
-	off, check := offset.(int64)
-	if !check {
-		return errors.New("Offset is in inproper format.")
-	}
 
 	if ok {
-		log.Infof("Delete called for key %s, and offset %s", key, offset)
+		log.Infof("Delete called for key %s")
 		path := filepath.Join(".", STORAGE_DIR)
 		path = filepath.Join(path, STORAGE_FILE)
-
-		return WriteDel(path, off)
+		_, err := WritePut(path, key, "")
+		if err != nil {
+			return err
+		}
+		log.Infof("Deleted (tombstoned) key %s", key)
 	}
 
 	return nil
@@ -161,54 +160,6 @@ func ReadGet(filePath string, offset int64) (string, error) {
 	storeFile.Close()
 
 	return value, nil
-}
-
-func WriteDel(filePath string, offset int64) error {
-	storeFile, openErr := os.Open(filePath)
-
-	if openErr != nil {
-		return openErr
-	}
-
-	_, seekErr := storeFile.Seek(offset, 0)
-	if seekErr != nil {
-		return openErr
-	}
-
-	reader := csv.NewReader(storeFile)
-	log.Infoln("Reading persistent file.")
-	record, err := reader.Read()
-
-	if err != nil {
-		storeFile.Close()
-		return err
-	}
-
-	length := len(record[0]) + len(record[1]) + 2
-	storeFile.Close()
-
-	storeFile, openErr = os.OpenFile(filePath, os.O_WRONLY, 0644)
-
-	if openErr != nil {
-		return openErr
-	}
-
-	log.Infof("Read entry length %d", length)
-	var newString string = ","
-	for i := 2; i < length; i++ {
-		newString += " "
-	}
-	newString += "\n"
-	log.Infof("Created replacement string (empty) '%s'", newString)
-	_, seekErr = storeFile.Seek(0, io.SeekStart)
-	if seekErr != nil {
-		storeFile.Close()
-		return openErr
-	}
-
-	_, writeErr := storeFile.WriteAt([]byte(newString), offset)
-	storeFile.Close()
-	return writeErr
 }
 
 func fileExists(filename string) bool {
@@ -322,11 +273,13 @@ func LoadIndexData(cache Cache, filePath string) (err error) {
 		lineBytes, _ := buffer.ReadBytes('\n')
 		log.Infoln("Read line bytes.")
 		key := record[0]
+		value := record[1]
 
-		if key != "" {
+		if value != "" {
 			cache.Add(key, position)
 		} else {
-			log.Info("Empty line from delete detected, skipping.")
+			log.Info("Tombstone detected removing key from index.")
+			cache.Remove(key)
 		}
 
 		position += int64(len(lineBytes))
