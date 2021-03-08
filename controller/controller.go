@@ -63,10 +63,7 @@ func ReadCsvCommands(filePath string, outputPath string) {
 		}
 	}
 
-	err = kvstore.SaveIndex(kvStore.IndexCache)
-	if err != nil {
-		log.Fatal("Could not save index data.")
-	}
+	kvStore.Shutdown()
 }
 
 func WriteOutputFirstLine(outputPath string) error {
