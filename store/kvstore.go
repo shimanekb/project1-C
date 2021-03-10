@@ -3,12 +3,15 @@ package kvstore
 import (
 	"bytes"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 const (
@@ -16,13 +19,23 @@ const (
 	LOG_FLUSH_THRESHOLD   int    = 10
 	STORAGE_DIR           string = "storage"
 	STORAGE_FILE          string = "data_records.csv"
-	INDEX_FILE            string = "index_file.csv"
-	INDEX_SWAP_FILE       string = "index_swap_file.csv"
+	INDEX_FILE            string = "index_file.json"
+	INDEX_SWAP_FILE       string = "index_swap_file.json"
 	GET_COMMAND           string = "get"
 	PUT_COMMAND           string = "put"
 	DEL_COMMAND           string = "del"
 	TOMB_FLAG             string = "Tomb"
 )
+
+type Index struct {
+	LastOffset int64       `json:"lastOffset"`
+	KeyOffsets []KeyOffset `json:"keyOffsets"`
+}
+
+type KeyOffset struct {
+	Key    string `json:"key"`
+	Offset int64  `json:"offset"`
+}
 
 type Store interface {
 	Put(key string, value string) error
@@ -43,8 +56,8 @@ type KvPair struct {
 }
 
 // Add error if shutdown.
-// TODO index file lock
 type KvStore struct {
+	LastLineOffset     int64
 	Cache              Cache
 	IndexCache         Cache
 	indexBufferChannel chan KvPair
@@ -133,7 +146,7 @@ func NewKvStore() *KvStore {
 
 	path := filepath.Join(".", STORAGE_DIR)
 	path = filepath.Join(path, STORAGE_FILE)
-	loadErr := LoadIndex(indexCache)
+	offset, loadErr := LoadIndex(indexCache)
 	for _, key := range indexCache.Keys() {
 		value, _ := indexCache.Get(key)
 		indexCacheCopy.Add(key, value)
@@ -151,7 +164,20 @@ func NewKvStore() *KvStore {
 	go FlushLog(logBuffer, indexBuffer)
 	go FlushIndex(indexCacheCopy, indexBuffer, done)
 
-	return &KvStore{cache, indexCache, indexBuffer, logBuffer, done}
+	return &KvStore{offset, cache, indexCache, indexBuffer, logBuffer, done}
+}
+
+func getMaxOffset(indexCache Cache) int64 {
+	var maxOffset int64 = 0
+	for _, key := range indexCache.Keys() {
+		value, _ := indexCache.Get(key)
+		offset, _ := value.(int64)
+		if offset > maxOffset {
+			maxOffset = offset
+		}
+	}
+
+	return maxOffset
 }
 
 func FlushIndex(initCache Cache, indexBuffer chan KvPair, done chan bool) {
@@ -175,35 +201,17 @@ func FlushIndex(initCache Cache, indexBuffer chan KvPair, done chan bool) {
 				}
 			}
 
-			file, err := os.OpenFile(swap_path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+			for _, pair := range pairs {
+				if !pair.Tomb {
+					initCache.Add(pair.Key, pair.Offset)
+				} else {
+					initCache.Remove(pair.Key)
+				}
+			}
+
+			err := WriteIndex(initCache, swap_path)
 			if err != nil {
 				log.Fatal("Could not open swap temp index file.")
-			}
-			defer file.Close()
-
-			for _, pair := range pairs {
-
-				if pair.Tomb {
-					initCache.Remove(pair.Key)
-					log.Info("Pair is a tombstone. No need for write.")
-				} else {
-					k := pair.Key
-					value := pair.Offset
-					initCache.Add(k, value)
-
-				}
-
-			}
-
-			for _, key := range initCache.Keys() {
-				if key != "" {
-					value, _ := initCache.Get(key)
-					log.Infof("Writing flush key %s, %d", key, value)
-					_, write_err := file.WriteString(fmt.Sprintf("%s,%d\n", key, value))
-					if write_err != nil {
-						log.Fatal("Unable to write cache (index) to disk tmp index for key %s", key)
-					}
-				}
 			}
 
 			pairs = make([]KvPair, 0, 100)
@@ -225,6 +233,32 @@ func FlushIndex(initCache Cache, indexBuffer chan KvPair, done chan bool) {
 		}
 	}
 
+}
+
+func WriteIndex(indexCache Cache, filepath string) error {
+	maxOffset := getMaxOffset(indexCache)
+	index := Index{maxOffset, make([]KeyOffset, 0, 100)}
+	for _, key := range indexCache.Keys() {
+		value, _ := indexCache.Get(key)
+		offsetValue, _ := value.(int64)
+		keyOffset := KeyOffset{key, offsetValue}
+		index.KeyOffsets = append(index.KeyOffsets, keyOffset)
+	}
+
+	file, err := json.MarshalIndent(index, "", " ")
+	if err != nil {
+		log.Fatal("Could not open swap temp index file.")
+		return err
+	}
+
+	write_err := ioutil.WriteFile(filepath, file, 0644)
+
+	if write_err != nil {
+		log.Fatal("Unable to write cache (index) offset to start.")
+		return write_err
+	}
+
+	return nil
 }
 
 func FlushLog(logBuffer chan Command, indexBuffer chan KvPair) {
@@ -336,27 +370,44 @@ func fileExists(filename string) bool {
 	return !info.IsDir()
 }
 
-func LoadIndex(cache Cache) (err error) {
+func LoadIndex(cache Cache) (lastLineOffset int64, err error) {
 	path := filepath.Join(".", STORAGE_DIR)
 	path = filepath.Join(path, INDEX_FILE)
+	var offset int64 = 0
 
 	if fileExists(path) {
 		log.Info("Index data found loading from disk.")
-		return LoadKeyValueData(cache, path)
-	} else {
-		log.Info("Index data not found reconstructing from log on disk.")
-		return LoadIndexData(cache, path)
+		offset, err = LoadKeyValueData(cache, path)
 	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	log.Info("Reading any missing data from log on disk.")
+	return LoadIndexData(offset, cache, path)
 }
 
-func LoadKeyValueData(cache Cache, filePath string) (err error) {
-	storeFile, openErr := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR, 0644)
+func LoadKeyValueData(cache Cache, filePath string) (lastLineOffset int64, err error) {
+	storeFile, openErr := os.OpenFile(filePath, os.O_CREATE|os.O_RDONLY, 0644)
 
 	if openErr != nil {
-		return openErr
+		return 0, openErr
 	}
 
 	csvReader := csv.NewReader(storeFile)
+
+	log.Infoln("Reading first line for current offeset.")
+	rec, rerr := csvReader.Read()
+
+	if rerr != nil {
+		return 0, err
+	}
+
+	lastLineOffset, conversionErr := strconv.ParseInt(rec[0], 10, 64)
+	if conversionErr != nil {
+		return 0, conversionErr
+	}
 
 	log.Infoln("Reading persistent file key value data from disk.")
 	for {
@@ -378,20 +429,24 @@ func LoadKeyValueData(cache Cache, filePath string) (err error) {
 	}
 
 	log.Infoln("Successfully Read key, value data from disk.")
-	return err
+	return lastLineOffset, err
 }
 
-func LoadIndexData(cache Cache, filePath string) (err error) {
+func LoadIndexData(startingOffset int64, cache Cache, filePath string) (lastLineOffset int64, err error) {
 	storeFile, openErr := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR, 0644)
 
 	if openErr != nil {
-		return openErr
+		return 0, openErr
 	}
 
 	var buffer bytes.Buffer
 	var position int64
 	reader := io.TeeReader(storeFile, &buffer)
 	csvReader := csv.NewReader(reader)
+	_, seekErr := storeFile.Seek(startingOffset, 0)
+	if seekErr != nil {
+		return 0, seekErr
+	}
 
 	log.Infoln("Reading persistent file into cache with offsets.")
 	for {
@@ -424,5 +479,5 @@ func LoadIndexData(cache Cache, filePath string) (err error) {
 	}
 
 	log.Infoln("Successfully Read persistent file into cache with offsets.")
-	return err
+	return position, err
 }
