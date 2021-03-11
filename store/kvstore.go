@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 const (
@@ -26,14 +27,16 @@ const (
 	TOMB_FLAG             string = "Tomb"
 )
 
+var flushLock sync.RWMutex = sync.RWMutex{}
+
 type Index struct {
 	LastOffset int64       `json:"lastOffset"`
 	KeyOffsets []KeyOffset `json:"keyOffsets"`
 }
 
 type KeyOffset struct {
-	Key    string `json:"key"`
-	Offset int64  `json:"offset"`
+	Key     string  `json:"key"`
+	Offsets []int64 `json:"offsets"`
 }
 
 type Store interface {
@@ -72,56 +75,84 @@ func (k *KvStore) Shutdown() {
 }
 
 func (k *KvStore) Put(key string, value string) error {
-	path := filepath.Join(".", STORAGE_DIR)
-	path = filepath.Join(path, STORAGE_FILE)
-	offset, err := WritePut(path, key, value)
-	if err != nil {
-		return err
-	}
-
-	k.IndexCache.Add(key, offset)
 	k.Cache.Add(key, value)
 	k.logBufferChannel <- Command{PUT_COMMAND, key, value}
 
 	return nil
 }
 
-func (k KvStore) Get(key string) (value string, err error) {
-	v, ok := k.Cache.Get(key)
-
-	if ok == false {
-		offset, ok := k.IndexCache.Get(key)
-
-		if ok != true {
-			return "", errors.New("Unable to find offset in cache.")
+func ReadGet(path string, key string, offsets []int64) (string, string, error) {
+	for _, off := range offsets {
+		k, v, err := ReadKvItem(path, off)
+		if err != nil {
+			return "", "", err
 		}
 
-		off, check := offset.(int64)
-		if !check {
-			return "", errors.New("Offset is in inproper format.")
+		if k == key {
+			value := fmt.Sprintf("%v", v)
+			return key, value, nil
 		}
-		path := filepath.Join(".", STORAGE_DIR)
-		path = filepath.Join(path, STORAGE_FILE)
-
-		value, err = ReadGet(path, off)
-	} else {
-		value = fmt.Sprintf("%v", v)
 	}
 
-	return value, err
+	return "", "", errors.New("Unable to read key value.")
+}
+
+func (k KvStore) Get(key string) (string, error) {
+	value, cacheOk := k.Cache.Get(key)
+
+	if cacheOk {
+		return fmt.Sprintf("%v", value), nil
+	}
+
+	log.Infof("Read for key %s was not in cache, reading disk", key)
+	partialKey := getPartialKey(key)
+	flushLock.RLock()
+	offsets, ok := k.IndexCache.Get(partialKey)
+	flushLock.RUnlock()
+
+	if !ok {
+		return "", errors.New("Offsets not in index!.")
+	}
+	offs, check := offsets.([]int64)
+	if !check {
+		return "", errors.New("Offset is in inproper format.")
+	}
+
+	path := filepath.Join(".", STORAGE_DIR)
+	path = filepath.Join(path, STORAGE_FILE)
+	_, v, err := ReadGet(path, key, offs)
+	if err != nil {
+		return "", err
+	}
+
+	return v, nil
 }
 
 func (k *KvStore) Del(key string) error {
-	_, ok := k.IndexCache.Get(key)
 	k.Cache.Remove(key)
-	k.IndexCache.Remove(key)
-
-	log.Infof("Delete called for key %s")
+	RemoveIndexItem(k.IndexCache, key)
+	offsets, ok := k.IndexCache.Get(getPartialKey(key))
 	if ok {
-		k.logBufferChannel <- Command{DEL_COMMAND, key, ""}
+		offs, ok := offsets.([]int64)
+		if len(offs) > 0 && ok {
+			log.Infof("After removing off for key %s, %d", key, offs[0])
+		} else if ok {
+			log.Infof("After removing off for key %s, %d", key, -1)
+		}
 	}
+	log.Infof("Delete called for key %s", key)
+	k.logBufferChannel <- Command{DEL_COMMAND, key, ""}
 
 	return nil
+}
+
+func getPartialKey(key string) string {
+	partialKey := key
+	if len(key) > 16 {
+		partialKey = key[0:15]
+	}
+
+	return partialKey
 }
 
 func NewKvStore() *KvStore {
@@ -137,8 +168,6 @@ func NewKvStore() *KvStore {
 	log.Info("Created storage directory.")
 
 	indexCache, cErr := NewSimpleCache()
-	indexCacheCopy, _ := NewSimpleCache()
-
 	if cErr != nil {
 		log.Fatal("Could not create cache for kv store.")
 	}
@@ -146,10 +175,6 @@ func NewKvStore() *KvStore {
 	path := filepath.Join(".", STORAGE_DIR)
 	path = filepath.Join(path, STORAGE_FILE)
 	offset, loadErr := LoadIndex(indexCache)
-	for _, key := range indexCache.Keys() {
-		value, _ := indexCache.Get(key)
-		indexCacheCopy.Add(key, value)
-	}
 
 	if loadErr != nil {
 		log.Fatal("Could not load data into offset cache.")
@@ -160,23 +185,10 @@ func NewKvStore() *KvStore {
 	logBuffer := make(chan Command, LOG_FLUSH_THRESHOLD)
 	done := make(chan bool)
 
-	go FlushLog(logBuffer, indexBuffer)
-	go FlushIndex(indexCacheCopy, indexBuffer, done)
+	go FlushLog(indexCache, logBuffer, indexBuffer)
+	go FlushIndex(indexCache, indexBuffer, done)
 
 	return &KvStore{offset, cache, indexCache, indexBuffer, logBuffer, done}
-}
-
-func getMaxOffset(indexCache Cache) int64 {
-	var maxOffset int64 = 0
-	for _, key := range indexCache.Keys() {
-		value, _ := indexCache.Get(key)
-		offset, _ := value.(int64)
-		if offset > maxOffset {
-			maxOffset = offset
-		}
-	}
-
-	return maxOffset
 }
 
 func FlushIndex(initCache Cache, indexBuffer chan KvPair, done chan bool) {
@@ -200,15 +212,14 @@ func FlushIndex(initCache Cache, indexBuffer chan KvPair, done chan bool) {
 				}
 			}
 
+			lastOffset, _ := LoadIndexJson(initCache, path)
 			for _, pair := range pairs {
 				if !pair.Tomb && pair.Key != "" {
-					initCache.Add(pair.Key, pair.Offset)
-				} else {
-					initCache.Remove(pair.Key)
+					lastOffset = pair.Offset
 				}
 			}
 
-			err := WriteIndex(initCache, swap_path)
+			err := WriteIndex(lastOffset, initCache, swap_path)
 			if err != nil {
 				log.Fatal("Could not open swap temp index file.")
 			}
@@ -234,13 +245,14 @@ func FlushIndex(initCache Cache, indexBuffer chan KvPair, done chan bool) {
 
 }
 
-func WriteIndex(indexCache Cache, filepath string) error {
-	maxOffset := getMaxOffset(indexCache)
+func WriteIndex(maxOffset int64, indexCache Cache, filepath string) error {
 	index := Index{maxOffset, make([]KeyOffset, 0, len(indexCache.Keys()))}
+
+	log.Infof("Last offset is %d", maxOffset)
 	for _, key := range indexCache.Keys() {
 		if key != "" {
 			value, _ := indexCache.Get(key)
-			offsetValue, _ := value.(int64)
+			offsetValue, _ := value.([]int64)
 			keyOffset := KeyOffset{key, offsetValue}
 			index.KeyOffsets = append(index.KeyOffsets, keyOffset)
 
@@ -263,7 +275,7 @@ func WriteIndex(indexCache Cache, filepath string) error {
 	return nil
 }
 
-func FlushLog(logBuffer chan Command, indexBuffer chan KvPair) {
+func FlushLog(indexCache Cache, logBuffer chan Command, indexBuffer chan KvPair) {
 	path := filepath.Join(".", STORAGE_DIR)
 	path = filepath.Join(path, STORAGE_FILE)
 	var commands []Command = make([]Command, 0, 10)
@@ -273,6 +285,7 @@ func FlushLog(logBuffer chan Command, indexBuffer chan KvPair) {
 
 		if len(commands) == LOG_FLUSH_THRESHOLD || !ok {
 			log.Infof("Log items flushing, threshold %d met or shutdown signal given.", LOG_FLUSH_THRESHOLD)
+			flushLock.Lock()
 			for _, cmd := range commands {
 				if cmd.Type == PUT_COMMAND {
 					offset, err := WritePut(path, cmd.Key, cmd.Value)
@@ -280,8 +293,13 @@ func FlushLog(logBuffer chan Command, indexBuffer chan KvPair) {
 						log.Fatal("Could not flush log!")
 					}
 
+					AddIndexItem(indexCache, cmd.Key, offset)
 					indexBuffer <- KvPair{cmd.Key, false, offset}
-				} else if cmd.Type == DEL_COMMAND {
+				}
+			}
+			flushLock.Unlock()
+			for _, cmd := range commands {
+				if cmd.Type == DEL_COMMAND {
 					_, err := WritePut(path, cmd.Key, "")
 
 					if err != nil {
@@ -320,6 +338,7 @@ func WriteDelete(filePath string, key string, value string) (offset int64, err e
 	offset = fi.Size() - int64(length)
 	return offset, write_err
 }
+
 func WritePut(filePath string, key string, value string) (offset int64, err error) {
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	defer file.Close()
@@ -337,33 +356,6 @@ func WritePut(filePath string, key string, value string) (offset int64, err erro
 	return offset, write_err
 }
 
-func ReadGet(filePath string, offset int64) (string, error) {
-	storeFile, openErr := os.Open(filePath)
-
-	if openErr != nil {
-		return "", openErr
-	}
-
-	_, seekErr := storeFile.Seek(offset, 0)
-	if seekErr != nil {
-		return "", openErr
-	}
-
-	reader := csv.NewReader(storeFile)
-	log.Infoln("Reading persistent file.")
-	record, err := reader.Read()
-
-	if err != nil {
-		storeFile.Close()
-		return "", err
-	}
-
-	value := record[1]
-	storeFile.Close()
-
-	return value, nil
-}
-
 func fileExists(filename string) bool {
 	info, err := os.Stat(filename)
 	if os.IsNotExist(err) {
@@ -375,11 +367,21 @@ func fileExists(filename string) bool {
 func LoadIndex(cache Cache) (lastLineOffset int64, err error) {
 	path := filepath.Join(".", STORAGE_DIR)
 	path = filepath.Join(path, INDEX_FILE)
-	var offset int64 = 0
+	lastLineOffset = 0
 
 	if fileExists(path) {
 		log.Info("Index data found loading from disk.")
-		offset, err = LoadIndexJson(cache, path)
+		storeFile, openErr := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0644)
+		if openErr != nil {
+			return 0, openErr
+		}
+		defer storeFile.Close()
+
+		byteValue, _ := ioutil.ReadAll(storeFile)
+		var index Index
+		json.Unmarshal(byteValue, &index)
+
+		lastLineOffset = index.LastOffset
 	}
 
 	if err != nil {
@@ -390,7 +392,7 @@ func LoadIndex(cache Cache) (lastLineOffset int64, err error) {
 
 	path = filepath.Join(".", STORAGE_DIR)
 	path = filepath.Join(path, STORAGE_FILE)
-	return LoadIndexData(offset, cache, path)
+	return LoadIndexData(lastLineOffset, cache, path)
 }
 
 func LoadIndexJson(cache Cache, filePath string) (lastLineOffset int64, err error) {
@@ -407,10 +409,101 @@ func LoadIndexJson(cache Cache, filePath string) (lastLineOffset int64, err erro
 	lastLineOffset = index.LastOffset
 	log.Infof("Last offset was %d", lastLineOffset)
 	for _, kv := range index.KeyOffsets {
-		cache.Add(kv.Key, kv.Offset)
+		for _, off := range kv.Offsets {
+			AddIndexItem(cache, kv.Key, off)
+		}
 	}
 
 	return lastLineOffset, nil
+}
+
+func ReadKvItem(filePath string, offset int64) (key string, value interface{}, err error) {
+	storeFile, openErr := os.Open(filePath)
+
+	if openErr != nil {
+		return "", nil, openErr
+	}
+
+	_, seekErr := storeFile.Seek(offset, 0)
+	if seekErr != nil {
+		return "", nil, openErr
+	}
+
+	reader := csv.NewReader(storeFile)
+	log.Infoln("Reading persistent file.")
+	record, err := reader.Read()
+
+	if err != nil {
+		storeFile.Close()
+		return "", nil, err
+	}
+
+	key = record[0]
+	value = record[1]
+	storeFile.Close()
+
+	return key, value, nil
+}
+
+func RemoveIndexItem(cache Cache, key string) {
+	path := filepath.Join(".", STORAGE_DIR)
+	path = filepath.Join(path, STORAGE_FILE)
+	partialKey := getPartialKey(key)
+	values, ok := cache.Get(partialKey)
+	newOffsets := make([]int64, 0, 1)
+
+	if partialKey != "" && ok {
+		offsets, check := values.([]int64)
+		if !check {
+			log.Fatal("could not retrieve offsets from cache to remove index item.")
+		}
+
+		for _, offset := range offsets {
+			k, _, err := ReadKvItem(path, offset)
+			if err != nil {
+				log.Fatal("Could not read kv item")
+				break
+			}
+
+			if key == k {
+				log.Infof("Found correct offset for key %s, removing offset %d", key, offset)
+				continue
+			} else {
+				log.Infof("Adding checked offset non match key %s, offset %d", key, offset)
+				newOffsets = append(newOffsets, offset)
+			}
+		}
+
+		cache.Add(partialKey, newOffsets)
+	}
+
+}
+
+func AddIndexItem(cache Cache, key string, offset int64) {
+	partialKey := getPartialKey(key)
+	values, ok := cache.Get(partialKey)
+
+	if ok {
+		log.Infof("offsets found in index cache for key %s", key)
+		offsets, check := values.([]int64)
+		if !check {
+			log.Fatal("could not retrieve offsets from cache to add new index item.")
+		}
+
+		RemoveIndexItem(cache, key)
+		values, _ = cache.Get(partialKey)
+		offsets, _ = values.([]int64)
+
+		offsets = append(offsets, offset)
+		cache.Add(partialKey, offsets)
+	} else {
+
+		log.Infof("offsets not found in index cache for key %s, adding new offset", key)
+		offsets := make([]int64, 0, 1)
+		offsets = append(offsets, offset)
+		cache.Add(partialKey, offsets)
+	}
+
 }
 
 func LoadIndexData(startingOffset int64, cache Cache, filePath string) (lastLineOffset int64, err error) {
@@ -448,7 +541,7 @@ func LoadIndexData(startingOffset int64, cache Cache, filePath string) (lastLine
 		tomb := record[2]
 
 		if value != tomb {
-			cache.Add(key, position)
+			AddIndexItem(cache, key, position)
 		} else {
 			log.Info("Tombstone detected removing key from index.")
 			cache.Remove(key)
