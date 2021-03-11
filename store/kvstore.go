@@ -11,7 +11,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strconv"
 )
 
 const (
@@ -202,7 +201,7 @@ func FlushIndex(initCache Cache, indexBuffer chan KvPair, done chan bool) {
 			}
 
 			for _, pair := range pairs {
-				if !pair.Tomb {
+				if !pair.Tomb && pair.Key != "" {
 					initCache.Add(pair.Key, pair.Offset)
 				} else {
 					initCache.Remove(pair.Key)
@@ -237,12 +236,15 @@ func FlushIndex(initCache Cache, indexBuffer chan KvPair, done chan bool) {
 
 func WriteIndex(indexCache Cache, filepath string) error {
 	maxOffset := getMaxOffset(indexCache)
-	index := Index{maxOffset, make([]KeyOffset, 0, 100)}
+	index := Index{maxOffset, make([]KeyOffset, 0, len(indexCache.Keys()))}
 	for _, key := range indexCache.Keys() {
-		value, _ := indexCache.Get(key)
-		offsetValue, _ := value.(int64)
-		keyOffset := KeyOffset{key, offsetValue}
-		index.KeyOffsets = append(index.KeyOffsets, keyOffset)
+		if key != "" {
+			value, _ := indexCache.Get(key)
+			offsetValue, _ := value.(int64)
+			keyOffset := KeyOffset{key, offsetValue}
+			index.KeyOffsets = append(index.KeyOffsets, keyOffset)
+
+		}
 	}
 
 	file, err := json.MarshalIndent(index, "", " ")
@@ -377,7 +379,7 @@ func LoadIndex(cache Cache) (lastLineOffset int64, err error) {
 
 	if fileExists(path) {
 		log.Info("Index data found loading from disk.")
-		offset, err = LoadKeyValueData(cache, path)
+		offset, err = LoadIndexJson(cache, path)
 	}
 
 	if err != nil {
@@ -385,51 +387,30 @@ func LoadIndex(cache Cache) (lastLineOffset int64, err error) {
 	}
 
 	log.Info("Reading any missing data from log on disk.")
+
+	path = filepath.Join(".", STORAGE_DIR)
+	path = filepath.Join(path, STORAGE_FILE)
 	return LoadIndexData(offset, cache, path)
 }
 
-func LoadKeyValueData(cache Cache, filePath string) (lastLineOffset int64, err error) {
+func LoadIndexJson(cache Cache, filePath string) (lastLineOffset int64, err error) {
 	storeFile, openErr := os.OpenFile(filePath, os.O_CREATE|os.O_RDONLY, 0644)
-
 	if openErr != nil {
 		return 0, openErr
 	}
+	defer storeFile.Close()
 
-	csvReader := csv.NewReader(storeFile)
+	byteValue, _ := ioutil.ReadAll(storeFile)
+	var index Index
+	json.Unmarshal(byteValue, &index)
 
-	log.Infoln("Reading first line for current offeset.")
-	rec, rerr := csvReader.Read()
-
-	if rerr != nil {
-		return 0, err
+	lastLineOffset = index.LastOffset
+	log.Infof("Last offset was %d", lastLineOffset)
+	for _, kv := range index.KeyOffsets {
+		cache.Add(kv.Key, kv.Offset)
 	}
 
-	lastLineOffset, conversionErr := strconv.ParseInt(rec[0], 10, 64)
-	if conversionErr != nil {
-		return 0, conversionErr
-	}
-
-	log.Infoln("Reading persistent file key value data from disk.")
-	for {
-		record, readErr := csvReader.Read()
-		if readErr == io.EOF {
-			log.Info("End of file reached.")
-			break
-		}
-
-		if err != nil {
-			err = readErr
-			break
-		}
-
-		key := record[0]
-		value := record[1]
-
-		cache.Add(key, value)
-	}
-
-	log.Infoln("Successfully Read key, value data from disk.")
-	return lastLineOffset, err
+	return lastLineOffset, nil
 }
 
 func LoadIndexData(startingOffset int64, cache Cache, filePath string) (lastLineOffset int64, err error) {
@@ -461,9 +442,7 @@ func LoadIndexData(startingOffset int64, cache Cache, filePath string) (lastLine
 			break
 		}
 
-		log.Infoln("Reading line bytes.")
 		lineBytes, _ := buffer.ReadBytes('\n')
-		log.Infoln("Read line bytes.")
 		key := record[0]
 		value := record[1]
 		tomb := record[2]
