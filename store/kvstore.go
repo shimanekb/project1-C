@@ -36,6 +36,7 @@ type Index struct {
 
 type KeyOffset struct {
 	Key     string  `json:"key"`
+	Size    int     `json:"size"`
 	Offsets []int64 `json:"offsets"`
 }
 
@@ -54,6 +55,7 @@ type Command struct {
 type KvPair struct {
 	Key    string
 	Tomb   bool
+	Size   int
 	Offset int64
 }
 
@@ -253,7 +255,7 @@ func WriteIndex(maxOffset int64, indexCache Cache, filepath string) error {
 		if key != "" {
 			value, _ := indexCache.Get(key)
 			offsetValue, _ := value.([]int64)
-			keyOffset := KeyOffset{key, offsetValue}
+			keyOffset := KeyOffset{key, size, offsetValue}
 			index.KeyOffsets = append(index.KeyOffsets, keyOffset)
 
 		}
@@ -293,8 +295,9 @@ func FlushLog(indexCache Cache, logBuffer chan Command, indexBuffer chan KvPair)
 						log.Fatal("Could not flush log!")
 					}
 
+					var size int = len([]byte(cmd.Value))
 					AddIndexItem(indexCache, cmd.Key, offset)
-					indexBuffer <- KvPair{cmd.Key, false, offset}
+					indexBuffer <- KvPair{cmd.Key, false, size, offset}
 				}
 			}
 			flushLock.Unlock()
