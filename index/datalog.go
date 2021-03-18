@@ -2,13 +2,20 @@ package index
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
 )
 
+type LogPromise struct {
+	offset int64
+	err    error
+}
+
 type DataLog interface {
-	Read(offset int64) (logItem *LogItem, err error)
-	Add(key string, value string) (offset int64, err error)
+	ReadLogItem(offset int64) (logItem *LogItem, err error)
+	AddLogItem(logItem LogItem) (offset int64, err error)
 }
 
 type LogItem struct {
@@ -29,21 +36,24 @@ func (l *LogItem) Size() int64 {
 	return l.size
 }
 
-func NewLogItem(key string, value string, size int64) LogItem {
+func NewLogItem(key string, value string) LogItem {
+	size := int64(len([]byte(value)))
 	return LogItem{key, value, size}
 }
 
 type LocalDataLog struct {
 	flushThreshold int
 	filePath       string
+	buffer         []LogItem
 }
 
 func NewLocalDataLog(filePath string) DataLog {
-	dataLog := LocalDataLog{10, filePath}
+	buffer := make([]LogItem, 0, 10)
+	dataLog := LocalDataLog{10, filePath, buffer}
 	return &dataLog
 }
 
-func (l *LocalDataLog) Read(offset int64) (logItem *LogItem, err error) {
+func (l *LocalDataLog) ReadLogItem(offset int64) (logItem *LogItem, err error) {
 	storeFile, err := os.Open(l.filePath)
 
 	if err != nil {
@@ -66,21 +76,27 @@ func (l *LocalDataLog) Read(offset int64) (logItem *LogItem, err error) {
 
 	key := record[0]
 	value := record[1]
-	size := int64(len([]byte(value)))
+	s := record[2]
+	size, parseError := strconv.ParseInt(s, 10, 64)
 
-	li := NewLogItem(key, value, size)
+	if parseError != nil {
+		return nil, errors.New(fmt.Sprintf("Could not convert size to int for offset %d", offset))
+	}
+
+	li := NewLogItem(key, value)
+	li.size = size
 	return &li, nil
 }
 
-func (l *LocalDataLog) Add(key string, value string) (offset int64, err error) {
+func (l *LocalDataLog) AddLogItem(logItem LogItem) (offset int64, err error) {
 	file, err := os.OpenFile(l.filePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
-	defer file.Close()
 	if err != nil {
 		return 0, err
 	}
 
-	size := int64(len([]byte(value)))
-	length, write_err := file.WriteString(fmt.Sprintf("%s,%s,%d,\n", key, value, size))
+	defer file.Close()
+
+	length, write_err := file.WriteString(fmt.Sprintf("%s,%s,%d,\n", logItem.Key(), logItem.Value(), logItem.Size()))
 
 	if write_err != nil {
 		return 0, write_err

@@ -63,7 +63,7 @@ func (i *LocalIndex) Del(key string) {
 
 	for index, item := range indexItems {
 
-		logItem, err := i.localDataLog.Read(item.Offset())
+		logItem, err := i.localDataLog.ReadLogItem(item.Offset())
 		if err != nil {
 			break
 		}
