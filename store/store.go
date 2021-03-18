@@ -2,6 +2,7 @@ package kvstore
 
 import (
 	"github.com/shimanekb/project1-C/index"
+	log "github.com/sirupsen/logrus"
 	"math"
 )
 
@@ -68,6 +69,7 @@ func (s *LocalStore) Get(key string) (value string, ok bool) {
 }
 
 func (s *LocalStore) flushLog() {
+	log.Info("Flushing log.")
 	ids := s.idx
 	dl := s.idx.DataLog()
 	for _, cmd := range s.commandBuffer {
@@ -82,14 +84,15 @@ func (s *LocalStore) flushLog() {
 			ids.Put(iitem)
 		}
 	}
+	s.commandBuffer = make([]Command, 0, LOG_FLUSH_THRESHOLD)
 }
 
 func (s *LocalStore) flushIndex() {
+	log.Info("Flushing index.")
 	ids := s.idx
 	ids.Save()
 
 	s.commandCount = 0
-	s.commandBuffer = make([]Command, 0, INDEX_FLUSH_THRESHOLD)
 }
 
 func (s *LocalStore) Flush() {
@@ -113,11 +116,17 @@ func (s *LocalStore) flush() {
 func (s *LocalStore) Del(key string) {
 	s.commandCount = s.commandCount + 1
 	s.cache.Remove(key)
+	s.idx.Del(key)
 	s.commandBuffer = append(s.commandBuffer, Command{DEL_COMMAND, key, ""})
 	s.flush()
 }
 
 func (s *LocalStore) Put(key string, value string) error {
+	s.commandCount = s.commandCount + 1
+	s.cache.Add(key, value)
+	s.commandBuffer = append(s.commandBuffer, Command{PUT_COMMAND, key, value})
+	s.flush()
+
 	return nil
 }
 

@@ -3,6 +3,7 @@ package index
 import (
 	"encoding/csv"
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"io"
 	"math/rand"
 	"os"
@@ -63,6 +64,8 @@ func (i *LocalIndex) DataLog() DataLog {
 func (i *LocalIndex) Save() error {
 	var items []IndexItem
 	iitems := i.indexItems
+	log.Infof("Saving index file to %s", i.storageFilePath)
+	log.Infof("Collecting index items from index map of size %d.", len(iitems))
 	for _, value := range iitems {
 		for _, it := range value {
 			items = append(items, it)
@@ -72,15 +75,19 @@ func (i *LocalIndex) Save() error {
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].Offset() < items[j].Offset()
 	})
+	log.Info("Sorted index items by offset.")
 
-	fileName := fmt.Sprintf("index_swap%d.csv", rand.Int())
-	file, err := os.Open(fileName)
+	log.Info("Creating temp index file.")
+	fileName := fmt.Sprintf("./index_swap%d.csv", rand.Int())
+	file, err := os.OpenFile(fileName, os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
+		log.Error("Could not create tmp index file.", err)
 		return err
 	}
 	defer file.Close()
 
 	writer := csv.NewWriter(file)
+	log.Infof("Writing %d records to index.", len(items))
 	for _, item := range items {
 		var record []string
 		record = append(record, item.PartialKey())
@@ -92,6 +99,8 @@ func (i *LocalIndex) Save() error {
 
 	writer.Flush()
 
+	//Create index file if no exist
+	log.Infof("Swapping tmp index file as replacement.")
 	err = os.Rename(fileName, i.storageFilePath)
 
 	return err
@@ -104,29 +113,36 @@ func (i *LocalIndex) Get(key string) (indexItems []IndexItem, ok bool) {
 }
 
 func (i *LocalIndex) Put(indexItem IndexItem) {
+	log.Infof("Adding index item for partial key %s.", indexItem.PartialKey())
 	indexItems, ok := i.indexItems[indexItem.PartialKey()]
 	if !ok {
+		log.Infof("New key entry for %s, making new list.", indexItem.PartialKey())
 		indexItems = make([]IndexItem, 0)
 	}
 
-	indexItems = append(indexItems)
+	indexItems = append(indexItems, indexItem)
+	i.indexItems[indexItem.PartialKey()] = indexItems
+	log.Infof("Added index item for partial key %s.", indexItem.PartialKey())
 }
 
 func (i *LocalIndex) Del(key string) {
+	log.Infof("Deleting index item for key %s", key)
 	indexItems, ok := i.Get(key)
 
 	if !ok {
+		log.Infof("Index item for key %s does not exist, delete redundant.", key)
 		return
 	}
 
 	for index, item := range indexItems {
-
+		log.Infof("Look %d", item.Offset())
 		logItem, err := i.localDataLog.ReadLogItem(item.Offset())
 		if err != nil {
 			break
 		}
 
 		if logItem.Key() == key {
+			log.Infof("Log item found deleting for %s.", key)
 			indexItems[index] = indexItems[len(indexItems)-1]
 			i.indexItems[getPartialKey(key)] = indexItems[:len(indexItems)-1]
 			continue
@@ -149,16 +165,19 @@ func getLastIndex(index LocalIndex) int64 {
 }
 
 func (i *LocalIndex) Load() error {
+	log.Infof("Loading index data from %s", i.storageFilePath)
 	indexItems := i.indexItems
 	dataLog := i.localDataLog
 	var offset int64 = getLastIndex(*i)
 	for true {
 		logItem, err := dataLog.ReadLogItem(offset)
 		if err == io.EOF {
+			log.Infof("Reached end of data log file.")
 			break
 		}
 
 		if err != nil {
+			log.Error("Error encountered during reading log item.", err)
 			return err
 		}
 
@@ -169,6 +188,7 @@ func (i *LocalIndex) Load() error {
 
 	i.indexItems = indexItems
 
+	log.Infof("Loaded index data from %s", i.storageFilePath)
 	return nil
 }
 

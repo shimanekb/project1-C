@@ -44,6 +44,12 @@ func ReadCsvCommands(filePath string, outputPath string) {
 
 	reader := csv.NewReader(csv_file)
 	path := filepath.Join(".", STORAGE_DIR)
+	err = os.MkdirAll(path, os.ModePerm)
+
+	if err != nil {
+		log.Fatalf("Cannot create directory for storage at %s", STORAGE_DIR)
+	}
+
 	logPath := filepath.Join(path, STORAGE_FILE)
 	indexPath := filepath.Join(path, INDEX_FILE)
 	localStore, storeErr := store.NewLocalStore(logPath, indexPath)
