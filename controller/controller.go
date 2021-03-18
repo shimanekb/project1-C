@@ -4,10 +4,11 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
-	"github.com/shimanekb/project1-C/store"
+	store "github.com/shimanekb/project1-C/store"
 	log "github.com/sirupsen/logrus"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -15,6 +16,9 @@ const (
 	PUT_COMMAND       string = "put"
 	DEL_COMMAND       string = "del"
 	FIRST_LINE_RECORD string = "type"
+	STORAGE_DIR       string = "storage"
+	STORAGE_FILE      string = "data_records.csv"
+	INDEX_FILE        string = "index_file.csv"
 )
 
 type Command struct {
@@ -39,7 +43,13 @@ func ReadCsvCommands(filePath string, outputPath string) {
 	}
 
 	reader := csv.NewReader(csv_file)
-	kvStore := kvstore.NewKvStore()
+	path := filepath.Join(".", STORAGE_DIR)
+	logPath := filepath.Join(path, STORAGE_FILE)
+	indexPath := filepath.Join(path, INDEX_FILE)
+	localStore, storeErr := store.NewLocalStore(logPath, indexPath)
+	if storeErr != nil {
+		log.Fatal("Could not create store.", storeErr)
+	}
 
 	log.Infoln("Reading in csv records.")
 	for {
@@ -57,13 +67,13 @@ func ReadCsvCommands(filePath string, outputPath string) {
 			continue
 		}
 		command := Command{record[0], record[1], record[3]}
-		cmd_err := ProcessCommand(command, kvStore, outputPath)
+		cmd_err := ProcessCommand(command, localStore, outputPath)
 		if cmd_err != nil {
 			log.Errorln(cmd_err)
 		}
 	}
 
-	kvStore.Shutdown()
+	localStore.Flush()
 }
 
 func WriteOutputFirstLine(outputPath string) error {
@@ -91,13 +101,13 @@ func WriteOutput(command Command, outcome int, value string, outputPath string) 
 
 }
 
-func ProcessCommand(command Command, storage kvstore.Store, outputPath string) error {
+func ProcessCommand(command Command, storage store.Store, outputPath string) error {
 	switch {
 	case GET_COMMAND == command.Type:
 		log.Infof("Get command given for key: %s, value: %s", command.Key,
 			command.Value)
-		value, err := storage.Get(command.Key)
-		if err == nil {
+		value, ok := storage.Get(command.Key)
+		if ok {
 			WriteOutput(command, 1, value, outputPath)
 			log.Infof("Get command successful found value: %s, for key: %s",
 				value, command.Key)
@@ -105,7 +115,7 @@ func ProcessCommand(command Command, storage kvstore.Store, outputPath string) e
 			WriteOutput(command, 0, "", outputPath)
 		}
 
-		return err
+		return nil
 	case PUT_COMMAND == command.Type:
 		log.Infof("Put command given for key: %s, value: %s", command.Key,
 			command.Value)
@@ -115,15 +125,10 @@ func ProcessCommand(command Command, storage kvstore.Store, outputPath string) e
 	case DEL_COMMAND == command.Type:
 		log.Infof("Del command given for key: %s, value: %s", command.Key,
 			command.Value)
-		err := storage.Del(command.Key)
+		storage.Del(command.Key)
+		WriteOutput(command, 1, "", outputPath)
 
-		if err == nil {
-			WriteOutput(command, 1, "", outputPath)
-		} else {
-			WriteOutput(command, 0, "", outputPath)
-		}
-
-		return err
+		return nil
 	}
 
 	return errors.New(fmt.Sprintf("Invalid command given: %s", command))

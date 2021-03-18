@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 )
@@ -59,7 +60,7 @@ func NewLocalDataLog(filePath string) DataLog {
 }
 
 func (l *LocalDataLog) ReadLogItem(offset int64) (logItem *LogItem, err error) {
-	storeFile, err := os.Open(l.filePath)
+	storeFile, err := os.OpenFile(l.filePath, os.O_RDONLY|os.O_CREATE, 0644)
 
 	if err != nil {
 		return nil, err
@@ -69,7 +70,7 @@ func (l *LocalDataLog) ReadLogItem(offset int64) (logItem *LogItem, err error) {
 
 	stat, _ := storeFile.Stat()
 	if stat.Size() >= offset {
-		return nil, io.EOF.Error()
+		return nil, io.EOF
 	}
 
 	_, err = storeFile.Seek(offset, 0)

@@ -34,10 +34,11 @@ func (i *IndexItem) Offset() int64 {
 
 type Index interface {
 	Get(key string) (indexItems []IndexItem, ok bool)
-	Put(key string, indexItem IndexItem)
+	Put(indexItem IndexItem)
 	Del(key string)
 	DataLog() DataLog
 	Save() error
+	Load() error
 }
 
 func getPartialKey(key string) string {
@@ -53,6 +54,10 @@ type LocalIndex struct {
 	storageFilePath string
 	indexItems      map[string][]IndexItem
 	localDataLog    DataLog
+}
+
+func (i *LocalIndex) DataLog() DataLog {
+	return i.localDataLog
 }
 
 func (i *LocalIndex) Save() error {
