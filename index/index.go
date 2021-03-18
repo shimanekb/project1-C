@@ -3,6 +3,7 @@ package index
 import (
 	"encoding/csv"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"sort"
@@ -128,11 +129,47 @@ func (i *LocalIndex) Del(key string) {
 	}
 }
 
+func getLastIndex(index LocalIndex) int64 {
+	indexItems := index.indexItems
+	var offset int64 = 0
+	for _, values := range indexItems {
+		for _, item := range values {
+			if offset < item.Offset() {
+				offset = item.Offset()
+			}
+		}
+	}
+
+	return offset
+}
+
+func (i *LocalIndex) Load() error {
+	indexItems := i.indexItems
+	dataLog := i.localDataLog
+	var offset int64 = getLastIndex(*i)
+	for true {
+		logItem, err := dataLog.ReadLogItem(offset)
+		if err == io.EOF {
+			break
+		}
+
+		if err != nil {
+			return err
+		}
+
+		item := NewIndexItem(logItem.Key(), logItem.Offset(), logItem.Size())
+		indexItems[item.PartialKey()] = append(indexItems[item.PartialKey()], item)
+		offset = item.offset + item.size
+	}
+
+	i.indexItems = indexItems
+
+	return nil
+}
+
 func NewLocalIndex(storageFilePath string, dataLog DataLog) Index {
 	indexItems := make(map[string][]IndexItem)
 	localIndex := LocalIndex{storageFilePath, indexItems, dataLog}
-
-	//Load index if exist
 
 	return &localIndex
 }

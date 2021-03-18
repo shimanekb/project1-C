@@ -8,15 +8,21 @@ import (
 	"strconv"
 )
 
+type LocalDataLogReader struct {
+	filePath      string
+	currentOffset int64
+}
+
 type DataLog interface {
 	ReadLogItem(offset int64) (logItem *LogItem, err error)
 	AddLogItem(logItem LogItem) (offset int64, err error)
 }
 
 type LogItem struct {
-	key   string
-	value string
-	size  int64
+	key    string
+	value  string
+	size   int64
+	offset int64
 }
 
 func (l *LogItem) Key() string {
@@ -31,9 +37,13 @@ func (l *LogItem) Size() int64 {
 	return l.size
 }
 
-func NewLogItem(key string, value string) LogItem {
+func (l *LogItem) Offset() int64 {
+	return l.offset
+}
+
+func NewLogItem(key string, value string, offset int64) LogItem {
 	size := int64(len([]byte(value)))
-	return LogItem{key, value, size}
+	return LogItem{key, value, size, offset}
 }
 
 type LocalDataLog struct {
@@ -57,6 +67,11 @@ func (l *LocalDataLog) ReadLogItem(offset int64) (logItem *LogItem, err error) {
 
 	defer storeFile.Close()
 
+	stat, _ := storeFile.Stat()
+	if stat.Size() >= offset {
+		return nil, io.EOF.Error()
+	}
+
 	_, err = storeFile.Seek(offset, 0)
 	if err != nil {
 		return nil, err
@@ -78,7 +93,7 @@ func (l *LocalDataLog) ReadLogItem(offset int64) (logItem *LogItem, err error) {
 		return nil, errors.New(fmt.Sprintf("Could not convert size to int for offset %d", offset))
 	}
 
-	li := NewLogItem(key, value)
+	li := NewLogItem(key, value, offset)
 	li.size = size
 	return &li, nil
 }
