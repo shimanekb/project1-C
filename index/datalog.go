@@ -8,11 +8,6 @@ import (
 	"strconv"
 )
 
-type LogPromise struct {
-	offset int64
-	err    error
-}
-
 type DataLog interface {
 	ReadLogItem(offset int64) (logItem *LogItem, err error)
 	AddLogItem(logItem LogItem) (offset int64, err error)
